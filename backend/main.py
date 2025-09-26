@@ -5,6 +5,9 @@ from .aqicn import fetch_aqicn, fetch_aqicn_station
 from .calibration import fit_linear_calibration
 import pandas as pd
 from fastapi.middleware.cors import CORSMiddleware
+import os
+import subprocess
+from pathlib import Path
 
 app = FastAPI()
 
@@ -16,6 +19,25 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
+
+# Start InfluxDB process when the application starts
+def start_influxdb():
+    try:
+        # Get the parent directory of the current directory
+        parent_dir = str(Path(__file__).parent.parent)
+        
+        # Start influxd process
+        subprocess.Popen(
+            ["influxd"],
+            cwd=parent_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+    except Exception as e:
+        print(f"Error starting InfluxDB: {e}")
+
+# Start InfluxDB when the application starts
+start_influxdb()
 
 @app.post("/api/v1/ingest")
 def ingest(sensor: SensorData):
