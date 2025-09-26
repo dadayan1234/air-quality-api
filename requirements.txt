@@ -1,0 +1,23 @@
+# Web Framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.1
+
+# HTTP requests (untuk akses API AQICN)
+httpx==0.27.2
+
+# Data processing dan numerik
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.14.1   # untuk regresi / kalibrasi
+
+# Database Time Series (InfluxDB)
+influxdb-client==1.45.0
+
+# Pydantic untuk validasi schema
+pydantic==2.9.0
+
+# Logging & Utilities
+python-dotenv==1.0.1   # untuk environment variables, token, dsb.
+
+# Optional untuk visualisasi / debugging
+rich==13.7.1
