@@ -9,6 +9,11 @@ httpx==0.27.2
 pandas==2.2.2
 numpy==1.26.4
 scipy==1.14.1   # untuk regresi / kalibrasi
+scikit-learn==1.3.2
+joblib==1.4.1   # untuk load/save scaler
+tensorflow-cpu==2.14.0   # untuk load model LSTM
+keras==2.14.0
+
 
 # Database Time Series (InfluxDB)
 influxdb-client==1.45.0

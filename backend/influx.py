@@ -25,10 +25,6 @@ client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=ORG)
 write_api = client.write_api(write_options=SYNCHRONOUS)
 query_api = client.query_api()
 
-client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=ORG)
-write_api = client.write_api(write_options=SYNCHRONOUS)
-query_api = client.query_api()
-
 def _ensure_df(result):
     # query_data_frame may return list of DataFrames or DataFrame
     if isinstance(result, list):
@@ -76,9 +72,10 @@ def write_raw(sensor):
     except Exception as e:
         raise
 
-def write_reference_point(device_id: str, lat: float, lon: float, pm25_ref: float | None,
-                          co_ref: float | None, timestamp):
-    """Write a reference_readings point (from AQICN) associated to a device_id and time"""
+def write_reference_point(device_id: str, lat: float, lon: float,
+                          pm25_ref: float | None, co_ref: float | None,
+                          timestamp, ref_time: str | None = None):
+    """Write a reference_readings point with both ingest time (_time) and AQICN ref_time"""
     try:
         ts = timestamp
         if ts.tzinfo is None:
@@ -86,20 +83,34 @@ def write_reference_point(device_id: str, lat: float, lon: float, pm25_ref: floa
         else:
             ts = ts.astimezone(pytz.UTC)
 
+        fields = {}
+        if pm25_ref is not None:
+            fields["pm25_ref"] = float(pm25_ref)
+        if co_ref is not None:
+            fields["co_ref"] = float(co_ref)
+        if ref_time:
+            fields["ref_time"] = ref_time  # simpan waktu asli dari AQICN
+
+        if not fields:
+            return
+
         p = (
             Point("reference_readings")
             .tag("device_id", device_id)
             .tag("lat", f"{lat:.6f}")
             .tag("lon", f"{lon:.6f}")
+            .time(int(ts.timestamp() * 1e9), WritePrecision.NS)  # _time = waktu ingest
         )
-        if pm25_ref is not None:
-            p = p.field("pm25_ref", float(pm25_ref))
-        if co_ref is not None:
-            p = p.field("co_ref", float(co_ref))
-        p = p.time(int(ts.timestamp() * 1e9), WritePrecision.NS)
+
+        for k, v in fields.items():
+            p = p.field(k, v)
+
         write_api.write(bucket=BUCKET, org=ORG, record=p)
+
     except Exception as e:
         raise
+
+
 
 def query_tabular(measurement: str, start: str = "-1h"):
     """

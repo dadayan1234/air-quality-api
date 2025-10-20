@@ -9,6 +9,11 @@ from .calibration import fit_linear_calibration
 from datetime import timezone
 import pandas as pd
 from math import radians, sin, cos, sqrt, atan2
+import tensorflow as tf
+from keras.models import load_model 
+import joblib
+import numpy as np
+import sklearn
 
 app = FastAPI(title="AQI Calibration API")
 
@@ -19,6 +24,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+    
 # ---------- Utilities ----------
 def haversine_m(lat1, lon1, lat2, lon2):
     """Return distance in meters between two lat/lon points."""
@@ -43,7 +50,9 @@ def ingest(sensor: SensorData):
 
         # 2) try fetch AQICN for that lat/lon (graceful if fails)
         try:
-            ref = fetch_aqicn(sensor.lat, sensor.lon)
+            # ref = fetch_aqicn(sensor.lat, sensor.lon)
+            ref = fetch_aqicn_station(13653)  # Sleman
+            print(f"Fetched AQICN ref: {ref}")
         except HTTPException:
             ref = None
 
@@ -57,6 +66,7 @@ def ingest(sensor: SensorData):
                 time_utc = sensor.timestamp
                 if time_utc.tzinfo is None:
                     time_utc = time_utc.replace(tzinfo=timezone.utc)
+            print(f"pm25_ref={ref.get('pm25')}, co_ref={ref.get('co')} at {time_utc}")
 
             write_reference_point(
                 device_id=sensor.device_id,
@@ -80,7 +90,7 @@ def get_aqicn_sleman():
     return fetch_aqicn_station(13653)
 
 @app.post("/api/v1/calibrate/{device_id}")
-def calibrate(device_id: str, start: str = "-7d", max_distance_m: int = 1000):
+def calibrate(device_id: str = "sensor-001", start: str = "-7d", max_distance_m: int = 1000):
     """
     Calibrate device by pairing raw_readings with reference_readings.
     - start: flux range for querying (e.g. '-7d', '-1d', '-24h')
@@ -188,30 +198,169 @@ def calibrate(device_id: str, start: str = "-7d", max_distance_m: int = 1000):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# @app.get("/api/v1/readings")
+# def get_readings(measurement: str = "raw_readings", start: str = "-1h"):
+#     try:
+#         df = query_tabular(measurement, start)
+#         if df.empty:
+#             return {"status": "ok", "data": []}
+#         # map fields for client
+#         out = []
+#         for _, r in df.iterrows():
+#             out.append({
+#                 "device_id": r.get("device_id"),
+#                 "pm_raw": r.get("pm_raw"),
+#                 "co2_raw": r.get("co2_raw"),
+#                 "temperature": r.get("temp"),
+#                 "humidity": r.get("hum"),
+#                 "time": r.get("time"),
+#                 "lat": r.get("lat"),
+#                 "lon": r.get("lon")
+#             })
+#         return {"status": "ok", "data": out}
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/v1/readings")
 def get_readings(measurement: str = "raw_readings", start: str = "-1h"):
     try:
         df = query_tabular(measurement, start)
         if df.empty:
             return {"status": "ok", "data": []}
-        # map fields for client
+
         out = []
         for _, r in df.iterrows():
-            out.append({
-                "device_id": r.get("device_id"),
-                "pm_raw": r.get("pm_raw"),
-                "co2_raw": r.get("co2_raw"),
-                "temperature": r.get("temp"),
-                "humidity": r.get("hum"),
-                "time": r.get("time"),
-                "lat": r.get("lat"),
-                "lon": r.get("lon")
-            })
+            if measurement == "raw_readings":
+                out.append({
+                    "device_id": r.get("device_id"),
+                    "pm_raw": r.get("pm_raw"),
+                    "co2_raw": r.get("co2_raw"),
+                    "temperature": r.get("temp"),
+                    "humidity": r.get("hum"),
+                    "time": r.get("_time") or r.get("time"),
+                    "lat": r.get("lat"),
+                    "lon": r.get("lon"),
+                })
+            elif measurement == "reference_readings":
+                out.append({
+                    "device_id": r.get("device_id"),
+                    "pm25_ref": r.get("pm25_ref"),
+                    "co_ref": r.get("co_ref"),
+                    "time": r.get("_time") or r.get("time"),
+                    "lat": r.get("lat"),
+                    "lon": r.get("lon"),
+                })
         return {"status": "ok", "data": out}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+# ---------- Load model dan scaler di awal ----------
+MODEL_PATH = "backend/model/lstm_pm25_univariate_48hr_model.h5"
+SCALER_PATH = "backend/model/scaler_pm25_univariate.pkl"
 
+try:
+    model = load_model(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    print("✅ Model dan scaler berhasil dimuat.")
+except Exception as e:
+    print(f"⚠️ Gagal memuat model atau scaler: {e}")
+    model = None
+    scaler = None
 
-@app.get("/api/v1/aqicn/sleman")
-def get_aqicn_sleman():
-    return fetch_aqicn_station(13653)
+LOOK_BACK = 60
+FUTURE_STEPS = 48
+
+# ============================================================
+# ---------- Endpoint Forecasting PM2.5 ----------
+# ============================================================
+
+@app.get("/api/v1/forecast/{device_id}")
+def forecast(device_id: str, measurement: str = "raw_readings", look_back: int = LOOK_BACK):
+    """
+    Forecast PM2.5 untuk 48 jam ke depan menggunakan model LSTM (.h5)
+    - Ambil data terbaru dari InfluxDB untuk device_id tertentu.
+    - Jika data < look_back tetapi >= 32 titik, lakukan imputasi linier.
+    - Jika < 32 titik, kembalikan pesan error.
+    """
+    if model is None or scaler is None:
+        raise HTTPException(status_code=500, detail="Model atau scaler belum dimuat dengan benar.")
+
+    try:
+        # Ambil data terbaru dari InfluxDB (lebih spesifik ke device_id)
+        # Kita ambil 7 hari terakhir dan filter di sisi Python
+        df = query_tabular(measurement, start="-7d")
+
+        if df.empty:
+            raise HTTPException(status_code=404, detail="Tidak ada data sama sekali di InfluxDB.")
+
+        # Filter hanya untuk device_id yang diminta
+        df_dev = df[df["device_id"] == device_id].copy()
+        df_dev = df_dev.sort_values("time").reset_index(drop=True)
+
+        if df_dev.empty:
+            raise HTTPException(status_code=404, detail=f"Tidak ada data untuk device_id '{device_id}'.")
+
+        # Pastikan kolom 'pm_raw' tersedia
+        if "pm_raw" not in df_dev.columns:
+            raise HTTPException(status_code=400, detail="Kolom 'pm_raw' tidak ditemukan di hasil query.")
+
+        # Ambil nilai terakhir untuk prediksi
+        pm_values = df_dev["pm_raw"].dropna().values
+
+        if len(pm_values) == 0:
+            raise HTTPException(status_code=400, detail="Tidak ada nilai valid untuk 'pm_raw'.")
+
+        # Jika data cukup banyak, ambil yang terakhir sejumlah look_back
+        if len(pm_values) >= look_back:
+            pm_values = pm_values[-look_back:]
+        elif len(pm_values) >= 32:
+            # Jika data antara 32-59, lakukan imputasi linier agar jadi 60 titik
+            print(f"⚠️ Data hanya {len(pm_values)} titik, melakukan imputasi linier.")
+            # Interpolasi linear ke 60 titik
+            original_idx = np.linspace(0, 1, len(pm_values))
+            target_idx = np.linspace(0, 1, look_back)
+            pm_values = np.interp(target_idx, original_idx, pm_values)
+        else:
+            # Jika kurang dari 32 titik, tolak prediksi
+            raise HTTPException(
+                status_code=400,
+                detail=f"Data tidak cukup untuk prediksi (hanya {len(pm_values)} titik, minimal 32 diperlukan)."
+            )
+
+        # Normalisasi input menggunakan scaler
+        scaled_input = scaler.transform(np.array(pm_values).reshape(-1, 1))
+        scaled_input = scaled_input.reshape(1, look_back, 1)
+
+        # Prediksi (pastikan di CPU)
+        with tf.device("/CPU:0"):
+            predicted_scaled = model.predict(scaled_input)
+
+        # Invers transform hasil prediksi
+        predicted_original = scaler.inverse_transform(predicted_scaled).flatten()
+
+        # Format hasil
+        forecast_result = [
+            {"hour_ahead": int(i + 1), "predicted_pm25": round(float(val), 2)}
+            for i, val in enumerate(predicted_original)
+        ]
+
+        # Ambil waktu terakhir dari data sensor
+        last_time = pd.to_datetime(df_dev["time"].iloc[-1])
+        forecast_timestamps = pd.date_range(start=last_time, periods=FUTURE_STEPS + 1, freq="h")[1:]
+        for i in range(min(len(forecast_timestamps), len(forecast_result))):
+            forecast_result[i]["timestamp"] = forecast_timestamps[i].isoformat()
+
+        return {
+            "status": "ok",
+            "device_id": device_id,
+            "n_input_points": len(pm_values),
+            "imputed": len(pm_values) < look_back,
+            "predicted_steps": FUTURE_STEPS,
+            "forecast": forecast_result,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Terjadi kesalahan saat melakukan prediksi: {str(e)}")

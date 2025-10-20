@@ -129,21 +129,29 @@ import os
 import requests
 from fastapi import HTTPException
 from datetime import datetime, timedelta, timezone
+import logging
+
+logger = logging.getLogger("uvicorn.error")
 
 TOKEN = os.getenv("AQICN_TOKEN", "f55d003153c26913f857345cf056344ba8d33341")
 AQICN_BASE = "https://api.waqi.info"
 
 def _parse_time_to_utc(time_str: str):
-    # API typically returns "YYYY-MM-DD HH:MM:SS" in UTC — treat as UTC naive then set tz=UTC
+    """
+    Parse AQICN time string into timezone-aware UTC datetime.
+    Example: "2025-09-30 01:00:00" -> 2025-09-30T01:00:00+00:00
+    """
     if not time_str:
         return None
     try:
         dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-        return dt.replace(tzinfo=timezone.utc)
+        return dt.replace(tzinfo=timezone.utc)  # strictly UTC, no shift
     except Exception:
         return None
 
+
 def fetch_aqicn(lat: float, lon: float):
+    """Fetch reference AQI data for given coordinates"""
     url = f"{AQICN_BASE}/feed/geo:{lat};{lon}/?token={TOKEN}"
     try:
         r = requests.get(url, timeout=10)
@@ -158,6 +166,7 @@ def fetch_aqicn(lat: float, lon: float):
 
     d = js["data"]
     iaqi = d.get("iaqi", {})
+
     time_str = d.get("time", {}).get("s")
     ts_utc = _parse_time_to_utc(time_str)
 
@@ -172,15 +181,16 @@ def fetch_aqicn(lat: float, lon: float):
         "location": {
             "name": d.get("city", {}).get("name"),
             "coordinates": d.get("city", {}).get("geo"),
-            "station_url": d.get("city", {}).get("url")
+            "station_url": d.get("city", {}).get("url"),
         },
         "time": {
             "original": time_str,
             "utc": ts_utc.isoformat() if ts_utc else None,
-            # Jakarta/UTC+7 string
-            "jakarta": (ts_utc + timedelta(hours=7)).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S") if ts_utc else None
-        }
+            "jakarta": (ts_utc + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S") if ts_utc else None,
+        },
     }
+
+    logger.info(f"[FETCH AQICN] lat={lat}, lon={lon} → {result}")
     return result
 
 def fetch_aqicn_station(station_id: int):
@@ -210,6 +220,6 @@ def fetch_aqicn_station(station_id: int):
         "time": {
             "original": time_str,
             "utc": ts_utc.isoformat() if ts_utc else None,
-            "jakarta": (ts_utc + timedelta(hours=7)).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S") if ts_utc else None
+            "jakarta": (ts_utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S") if ts_utc else None
         }
     }
