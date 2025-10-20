@@ -6,7 +6,9 @@ import pytz
 import pandas as pd
 
 from influxdb_client.rest import ApiException
-from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.influxdb_client import InfluxDBClient 
+from influxdb_client.client.write.point import Point
+from influxdb_client.domain.write_precision import WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 # --- Konfigurasi InfluxDB ---
@@ -23,80 +25,93 @@ client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=ORG)
 write_api = client.write_api(write_options=SYNCHRONOUS)
 query_api = client.query_api()
 
-# --- Model Data Sensor ---
-class SensorData(BaseModel):
-    device_id: str
-    timestamp: datetime
-    lat: float
-    lon: float
-    pm_raw: float
-    co2_raw: float
-    temp: Optional[float] = None
-    hum: Optional[float] = None
+client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=ORG)
+write_api = client.write_api(write_options=SYNCHRONOUS)
+query_api = client.query_api()
 
-# --- Fungsi Menulis Data ---
-def write_raw(sensor: SensorData):
+def _ensure_df(result):
+    # query_data_frame may return list of DataFrames or DataFrame
+    if isinstance(result, list):
+        df = pd.concat(result, ignore_index=True)
+    else:
+        df = result
+    if df.empty:
+        return df
+    # Normalize column names: Influx pivot returns _time as timestamp
+    if "_time" in df.columns:
+        df = df.rename(columns={"_time": "time"})
+    # Reset index for clean iteration
+    return df.reset_index(drop=True)
+
+def write_raw(sensor):
     """
-    Menulis data sensor ke InfluxDB (bucket air-quality)
+    sensor: pydantic model (SensorData) or object with attributes
+    Writes to measurement 'raw_readings'
     """
     try:
-        # Pastikan timestamp UTC aware
-        ts_utc = sensor.timestamp
-        if ts_utc.tzinfo is None:
-            ts_utc = ts_utc.replace(tzinfo=pytz.UTC)
+        ts = sensor.timestamp
+        # make timezone-aware UTC
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=pytz.UTC)
         else:
-            ts_utc = ts_utc.astimezone(pytz.UTC)
+            ts = ts.astimezone(pytz.UTC)
 
-        # Buat point
         p = (
             Point("raw_readings")
             .tag("device_id", sensor.device_id)
-            .tag("lat", str(sensor.lat))  # tag karena jarang berubah
-            .tag("lon", str(sensor.lon))
+            .tag("lat", f"{sensor.lat:.6f}")
+            .tag("lon", f"{sensor.lon:.6f}")
             .field("pm_raw", float(sensor.pm_raw))
             .field("co2_raw", float(sensor.co2_raw))
         )
-
         if sensor.temp is not None:
             p = p.field("temp", float(sensor.temp))
         if sensor.hum is not None:
             p = p.field("hum", float(sensor.hum))
 
-        # Timestamp dengan presisi nanosecond
-        p = p.time(int(ts_utc.timestamp() * 1e9), WritePrecision.NS)
-
-        # Debug: lihat line protocol
-        print("[DEBUG] Line Protocol:", p.to_line_protocol())
-
-        # Tulis ke InfluxDB
+        p = p.time(int(ts.timestamp() * 1e9), WritePrecision.NS)
         write_api.write(bucket=BUCKET, org=ORG, record=p)
-        print(f"[{datetime.now()}] [WRITE] Data berhasil disimpan!")
-
     except ApiException as e:
-        print(f"[{datetime.now()}] [WRITE] Gagal menulis ke InfluxDB: {e.body}")
-        raise HTTPException(status_code=500, detail=f"Gagal menulis ke database: {e.body}")
-
+        raise RuntimeError(f"InfluxDB write error: {e.body}")
     except Exception as e:
-        print(f"[{datetime.now()}] [WRITE] Error umum saat memproses data: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error saat memproses data: {str(e)}")
+        raise
+
+def write_reference_point(device_id: str, lat: float, lon: float, pm25_ref: float | None,
+                          co_ref: float | None, timestamp):
+    """Write a reference_readings point (from AQICN) associated to a device_id and time"""
+    try:
+        ts = timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=pytz.UTC)
+        else:
+            ts = ts.astimezone(pytz.UTC)
+
+        p = (
+            Point("reference_readings")
+            .tag("device_id", device_id)
+            .tag("lat", f"{lat:.6f}")
+            .tag("lon", f"{lon:.6f}")
+        )
+        if pm25_ref is not None:
+            p = p.field("pm25_ref", float(pm25_ref))
+        if co_ref is not None:
+            p = p.field("co_ref", float(co_ref))
+        p = p.time(int(ts.timestamp() * 1e9), WritePrecision.NS)
+        write_api.write(bucket=BUCKET, org=ORG, record=p)
+    except Exception as e:
+        raise
 
 def query_tabular(measurement: str, start: str = "-1h"):
     """
-    Query data dari Influx, pivot supaya _field jadi kolom.
+    Returns a pandas.DataFrame pivoted so fields become columns.
+    'start' is Flux range spec like '-1h' or '2025-09-01T00:00:00Z'
     """
     q = f'''
     from(bucket:"{BUCKET}")
     |> range(start: {start})
-    |> filter(fn:(r) => r._measurement == "{measurement}")
+    |> filter(fn: (r) => r._measurement == "{measurement}")
     |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
     '''
     df = query_api.query_data_frame(org=ORG, query=q)
-
-    if isinstance(df, list):
-        df = pd.concat(df)
-
-    if not df.empty:
-        df = df.reset_index(drop=True)
-
-    return df
+    return _ensure_df(df)
 
